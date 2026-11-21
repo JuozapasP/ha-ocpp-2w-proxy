@@ -1,0 +1,31 @@
+---
+name: OCPP Two-Way Proxy
+version: "1.1.0"
+slug: ocpp_2w_proxy
+description: Proxy one OCPP 1.6J charger to Circle Link and Home Assistant
+url: https://github.com/JuozapasP/ha-ocpp-2w-proxy/tree/main/ocpp_2w_proxy
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+init: false
+ports:
+  "9100/tcp": 9100
+ports_description:
+  "9100/tcp": Charger OCPP 1.6 WebSocket
+options:
+  listen_port: 9100
+  primary_url: wss://ocpp.circlelink.app/
+  primary_cp_id: ""
+  secondary_url: ""
+  secondary_cp_id: ""
+  log_level: info
+schema:
+  listen_port: int
+  primary_url: str
+  primary_cp_id: str
+  primary_auth_password: "password?"
+  secondary_url: str
+  secondary_cp_id: str
+  log_level: "list(debug|info|warning|error)"

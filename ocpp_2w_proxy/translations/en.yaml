@@ -1,0 +1,42 @@
+---
+configuration:
+  listen_port:
+    name: Listen port
+    description: >-
+      Port the proxy binds inside the add-on. Leave this at 9100 so it matches
+      the published container port. To use another port on the LAN, change the
+      host port on the Network page and keep this value at 9100.
+  primary_url:
+    name: Primary CSMS URL
+    description: >-
+      Base WebSocket URL of the primary backend. Do not include the charge
+      point id. Circle Link is wss://ocpp.circlelink.app/
+  primary_cp_id:
+    name: Primary charge point id
+    description: >-
+      Required. The id Circle Link assigned to this charger
+      (<YOUR_CIRCLELINK_ID>). It is appended to the primary URL. The add-on
+      will not start while this is empty.
+  primary_auth_password:
+    name: Primary password
+    description: >-
+      Optional HTTP Basic password for the primary CSMS. Leave empty for
+      Circle Link. The username is the primary charge point id.
+  secondary_url:
+    name: Secondary CSMS URL
+    description: >-
+      Required. Base WebSocket URL of the Home Assistant OCPP integration,
+      with no charge point id. Example: ws://<HA_IP>:9000/ or
+      ws://homeassistant.local:9000/. Leave this empty until you fill it in.
+      The add-on will not start while it is empty.
+  secondary_cp_id:
+    name: Secondary charge point id
+    description: >-
+      Required. Charge point id the Home Assistant OCPP integration expects
+      (<CHARGER_ID>). It is appended to the secondary URL. The add-on will
+      not start while this is empty.
+  log_level:
+    name: Log level
+    description: How much detail to write to the add-on log.
+network:
+  "9100/tcp": Charger OCPP WebSocket

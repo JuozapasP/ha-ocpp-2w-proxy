@@ -1,0 +1,832 @@
+--- upstream/ocpp-2w-proxy.py
++++ patched/ocpp-2w-proxy.py
+@@ -1,324 +1,594 @@
+-# 2 way OCPP proxy (can also be used as a 1-way simple proxy)
++# 2 way OCPP proxy, patched for the Home Assistant add-on.
++#
++# Upstream: https://github.com/ocpp-balanz/ocpp-2w-proxy
++# Pinned commit: 5e02d2ce3becb4c334c57e21f386906376ff537c
++# Copyright (c) 2025 Jens Vedel Markussen, MIT License.
++#
++# Patch (do not drop when rebasing onto upstream):
++# - Map any incoming charge-point path to separate primary and secondary ids.
++#   Upstream appended the same path id to both CSMS URLs.
++# - Accept ids that are not strictly alphanumeric, including hyphenated ones.
++# - Disable WebSocket pings on the charger-facing server. The Elinta HomeBox
++#   does not answer PINGs, and upstream only set ping_timeout, so the library
++#   default (ping every 20s) drops the charger. Upstream pings stay at 20s.
++# - A dead secondary CSMS must not tear down the primary session.
++# - Force the ocpp1.6 subprotocol and disable permessage-deflate.
++# - Optional HTTP Basic auth toward the primary CSMS.
++# - Explicit default SSL context for wss:// so system CA certificates are used.
+ 
+ import asyncio
++import base64
++import configparser
++import json
+ import logging
++import signal
++import ssl
+ import time
++from enum import IntEnum
+ from typing import Tuple
+-import json
++from urllib.parse import quote, unquote, urlsplit, urlunsplit
+ 
+ import websockets
+-import websockets.asyncio
+ import websockets.asyncio.server
++from websockets.exceptions import ConnectionClosed
+ 
+-from enum import IntEnum
+-import ssl
+-import argparse
+-import configparser
++__version__ = "0.1.0+ha1"
++UPSTREAM_COMMIT = "5e02d2ce3becb4c334c57e21f386906376ff537c"
+ 
+-__version__ = "0.1.0"
+-
+-config = configparser.ConfigParser()
++config = configparser.ConfigParser(interpolation=None)
+ 
+ logging.basicConfig(
+     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+     datefmt="%Y-%m-%d %H:%M:%S",
++    level=logging.WARNING,
++    force=True,
+ )
+ logger = logging.getLogger("proxy")
+ 
+-class OCPP2WProxy: # Forward declaration
+-    pass
++# Set by main() so tests can read the bound socket.
++active_server = None
++
+ 
+ class OCPPMessageType(IntEnum):
+     Call = 2
+     CallResult = 3
+     CallError = 4
+ 
+-# main class
++
++def parse_ping(value: str, default: float | None) -> float | None:
++    """Return a ping interval, or None when keepalive is disabled."""
++    text = str(value).strip().lower()
++    if text in ("", "none", "null", "off", "disable", "disabled"):
++        return None
++    try:
++        number = float(text)
++    except ValueError:
++        logger.warning("Invalid ping value %r, using %s", value, default)
++        return default
++    if number <= 0:
++        return None
++    return number
++
++
++def optional_ping(section: str, option: str, default: float | None) -> float | None:
++    if not config.has_option(section, option):
++        return default
++    return parse_ping(config.get(section, option), default)
++
++
++def positive_float(section: str, option: str, default: float) -> float:
++    if not config.has_option(section, option):
++        return default
++    value = float(config.get(section, option))
++    if value < 0:
++        raise ValueError(f"{section}.{option} must be >= 0")
++    return value
++
++
++def validate_cp_id(cp_id: str) -> str:
++    """Accept the ids used on the wire, including hyphens."""
++    cp_id = unquote(str(cp_id)).strip()
++    if not cp_id or cp_id in (".", ".."):
++        raise ValueError("charge point id is empty")
++    if any(ord(ch) < 32 or ch in "/\\?# \t" for ch in cp_id):
++        raise ValueError(f"invalid charge point id {cp_id!r}")
++    return cp_id
++
++
++def extract_charger_id(path: str) -> str:
++    """Last path segment of the charger URL. The value is not the upstream id."""
++    path = path.split("?", 1)[0].split("#", 1)[0]
++    parts = [part for part in path.split("/") if part]
++    if not parts:
++        raise ValueError("connection URL has no charge point id")
++    return validate_cp_id(parts[-1])
++
++
++def configured_cp_id(option: str, fallback: str) -> str:
++    if config.has_option("ext-server", option):
++        value = config.get("ext-server", option).strip()
++        if value:
++            return validate_cp_id(value)
++    return validate_cp_id(fallback)
++
++
++def join_cp_url(base: str, cp_id: str) -> str:
++    """Append one charge point id to a CSMS base URL."""
++    base = base.strip()
++    parts = urlsplit(base)
++    if parts.scheme not in ("ws", "wss") or not parts.netloc:
++        raise ValueError(f"CSMS URL must be ws:// or wss://, got {base!r}")
++    if parts.username or parts.password:
++        raise ValueError("put the CSMS password in server_auth_password, not in the URL")
++    cp_id = validate_cp_id(cp_id)
++    path = "/" + quote(cp_id, safe="-_.~:")
++    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
++
++
++def safe_url(url: str) -> str:
++    parts = urlsplit(url)
++    if not (parts.username or parts.password):
++        return url
++    host = parts.hostname or ""
++    if parts.port:
++        host = f"{host}:{parts.port}"
++    return urlunsplit((parts.scheme, host, parts.path, "", ""))
++
++
++def basic_authorization(username: str, password: str) -> str:
++    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
++    return f"Basic {token}"
++
++
++def header_value(headers, name: str) -> str | None:
++    if headers is None:
++        return None
++    value = headers.get(name)
++    if value is None:
++        return None
++    value = str(value)
++    if not value or any(ch in value for ch in "\r\n\0"):
++        return None
++    return value
++
++
++def decode_ocpp_message(message) -> Tuple[OCPPMessageType, str]:
++    if isinstance(message, bytes):
++        message = message.decode("utf-8")
++    payload = json.loads(message)
++    if not isinstance(payload, list) or len(payload) < 2:
++        raise ValueError("not an OCPP message")
++    return OCPPMessageType(payload[0]), str(payload[1])
++
++
+ class OCPP2WProxy:
+-    # Static dict of OCPP2WProxy instances. key is charger_id
+-    proxy_list: dict[str, OCPP2WProxy] = {}
++    """One charger socket bridged to a primary CSMS and an optional secondary."""
+ 
+-    # Utility functions
+-    @staticmethod
+-    def decode_ocpp_message(message: str) -> Tuple[OCPPMessageType, str]:
+-        """Decode an OCPP message from a string"""
+-        j = json.loads(message)
+-        return [j[0], j[1]]
++    proxy_list: dict[str, "OCPP2WProxy"] = {}
+ 
+     def __init__(self, websocket: websockets.asyncio.server.ServerConnection, charger_id: str):
+-        # Store the websocket for later     
+-        logger.debug(websocket.request)
+         self.ws = websocket
+-        self.charger_id = charger_id
+-
+-        # Chech that charger id looks reasonable
+-        if not charger_id.isalnum():
+-            logger.error(f"Charger ID '{charger_id}' is not alphanumeric")
+-            raise Exception("Charger ID is not alphanumeric")
+-
+-        # Initialize table of CSMS call ids sent to the charger in order to respond back 
+-        self.primary_call_ids = set()
+-        self.secondary_call_ids = set()
+-
+-        # Insert new OCPP2WProxy instance in the (static) dict of instances.
+-        self.proxy_list[charger_id] = self
++        self.charger_id = validate_cp_id(charger_id)
++        self.primary_call_ids: set[str] = set()
++        self.secondary_call_ids: set[str] = set()
++        self.primary_connection = None
++        self.secondary_connection = None
++        self.secondary_url = None
++        self._secondary_headers: dict[str, str] = {}
++        self._secondary_lock = asyncio.Lock()
++        self._subprotocol = "ocpp1.6"
++        self._user_agent = "ocpp-2w-proxy"
++        self._upstream_ping_interval: float | None = 20
++        self._upstream_ping_timeout: float | None = 20
++        self._secondary_open_timeout = 5.0
++        self._retry = 5.0
++        self._stopping = False
++        self._closed = False
++        self._last_charger_update = time.time()
++        self.tasks: list[asyncio.Task] = []
++        OCPP2WProxy.proxy_list[self.charger_id] = self
+ 
+     async def close(self):
+-        """Close all connections to the charger and primary, secondary server"""
++        """Close this session's sockets. Safe to call more than once."""
++        if self._closed:
++            return
++        self._closed = True
++        self._stopping = True
++        for task in self.tasks:
++            task.cancel()
++        for socket in (self.ws, self.primary_connection, self.secondary_connection):
++            if socket is None:
++                continue
++            try:
++                await socket.close()
++            except Exception:
++                pass
++
++    def _connect_kwargs(self, url: str, headers: dict[str, str], open_timeout: float) -> dict:
++        kwargs = {
++            "uri": url,
++            "subprotocols": [self._subprotocol],
++            "additional_headers": headers or None,
++            "user_agent_header": self._user_agent,
++            "ping_interval": self._upstream_ping_interval,
++            "ping_timeout": self._upstream_ping_timeout,
++            "compression": None,
++            "proxy": None,
++            "open_timeout": open_timeout,
++        }
++        # wss uses the default trust store (SSL_CERT_FILE or the system CA bundle).
++        if url.startswith("wss://"):
++            kwargs["ssl"] = ssl.create_default_context()
++        return kwargs
++
++    async def connect_secondary(self) -> None:
++        if not self.secondary_url or self._stopping:
++            return
++        async with self._secondary_lock:
++            if self.secondary_connection is not None:
++                return
++        connection = await websockets.connect(
++            **self._connect_kwargs(
++                self.secondary_url,
++                self._secondary_headers,
++                self._secondary_open_timeout,
++            )
++        )
++        async with self._secondary_lock:
++            if self._stopping:
++                await connection.close()
++                return
++            self.secondary_connection = connection
++        logger.info("%s connected to secondary %s", self.charger_id, safe_url(self.secondary_url))
++
++    async def drop_secondary(self, connection) -> None:
++        async with self._secondary_lock:
++            if self.secondary_connection is connection:
++                self.secondary_connection = None
+         try:
+-            await self.ws.close()
+-            await self.primary_connection.close()
+-            if self.secondary_connection:
+-                await self.secondary_connection.close()
+-        except Exception as e:
+-            pass # Ignore exceptions
+-
+-    @staticmethod
+-    async def check_delete_old(charger_id: str):
+-        """Check if there are any old instances of this charger in the proxy list"""
+-        if charger_id in OCPP2WProxy.proxy_list:
+-            logger.info(f"Charger ID {charger_id} already exists. Closing and deleting")
+-            proxy: OCPP2WProxy = OCPP2WProxy.proxy_list[charger_id]
+-            await proxy.close()
+-            del OCPP2WProxy.proxy_list[charger_id]
++            await connection.close()
++        except Exception:
++            pass
++
++    async def send_secondary(self, message: str) -> None:
++        """Copy a charger message to the secondary CSMS. Failures stay local."""
++        async with self._secondary_lock:
++            connection = self.secondary_connection
++        if connection is None:
++            logger.warning("%s secondary is down; not copying this message", self.charger_id)
++            return
++        try:
++            await asyncio.wait_for(connection.send(message), timeout=10)
++        except Exception as exc:
++            logger.warning("%s secondary send failed: %s", self.charger_id, exc)
++            await self.drop_secondary(connection)
+ 
+     async def run(self):
+-        """Main loop for this proxy. This is where all the magic happens."""
+-
+-        # Create connections to the two CSMSes.
+-        # Forward any available Authorization and User-Agent headers
+-        headers = {}
+-        if "Authorization" in self.ws.request.headers:
+-            headers["Authorization"] = self.ws.request.headers["Authorization"]
+-            logger.debug(f'Authorization header set to {headers["Authorization"]}')
+-        user_agent = self.ws.request.headers.get("User-Agent", None) 
+-        subprotocols = self.ws.request.headers.get("Sec-WebSocket-Protocol", ["ocpp1.6"])
+-        primary_url = config.get("ext-server", "server") + "/" + self.charger_id
+-        if config.has_option("ext-server", "secondary_server"):
+-            secondary_url = config.get("ext-server", "secondary_server") + "/" + self.charger_id
+-        else:
+-            secondary_url = None    
+-
++        """Bridge one charger connection until the charger or the primary CSMS drops."""
+         try:
++            primary_cp_id = configured_cp_id("server_cp_id", self.charger_id)
++            secondary_cp_id = configured_cp_id("secondary_cp_id", self.charger_id)
++            primary_url = join_cp_url(config.get("ext-server", "server"), primary_cp_id)
++            secondary_base = config.get("ext-server", "secondary_server", fallback="").strip()
++            self.secondary_url = join_cp_url(secondary_base, secondary_cp_id) if secondary_base else None
++
++            self._subprotocol = self.ws.subprotocol or "ocpp1.6"
++            self._user_agent = header_value(self.ws.request.headers, "User-Agent") or "ocpp-2w-proxy"
++            charger_auth = header_value(self.ws.request.headers, "Authorization")
++            # The charger password (if any) belongs to the secondary CSMS it used
++            # before. Do not forward it to the primary; Circle Link has its own.
++            if charger_auth:
++                self._secondary_headers["Authorization"] = charger_auth
++
++            primary_headers: dict[str, str] = {}
++            password = ""
++            if config.has_option("ext-server", "server_auth_password"):
++                password = config.get("ext-server", "server_auth_password").strip()
++            if password:
++                primary_headers["Authorization"] = basic_authorization(primary_cp_id, password)
++
++            self._upstream_ping_interval = optional_ping("ext-server", "upstream_ping_interval", 20)
++            self._upstream_ping_timeout = optional_ping("ext-server", "upstream_ping_timeout", 20)
++            if self._upstream_ping_interval is None:
++                self._upstream_ping_timeout = None
++            self._secondary_open_timeout = positive_float("ext-server", "secondary_open_timeout", 5)
++            primary_open_timeout = positive_float("ext-server", "primary_open_timeout", 15)
++            self._retry = positive_float("ext-server", "secondary_retry_interval", 5)
++
++            logger.info(
++                "%s accepted subprotocol %s; primary %s; secondary %s; primary auth %s",
++                self.charger_id,
++                self._subprotocol,
++                safe_url(primary_url),
++                safe_url(self.secondary_url) if self.secondary_url else "disabled",
++                "on" if password else "off",
++            )
++
+             self.primary_connection = await websockets.connect(
+-                uri=primary_url,
+-                user_agent_header=user_agent,
+-                additional_headers=headers,
+-                subprotocols=[subprotocols],
++                **self._connect_kwargs(primary_url, primary_headers, primary_open_timeout)
+             )
+-            logger.info(f"Connected to primary server @ {primary_url}")
++            logger.info("%s connected to primary %s", self.charger_id, safe_url(primary_url))
+ 
+-            # Connect to secondary server if it is enabled.
+-            if secondary_url:
+-                self.secondary_connection = await websockets.connect(
+-                    uri=secondary_url,
+-                    user_agent_header=user_agent,
+-                    additional_headers=headers,
+-                    subprotocols=[subprotocols],
+-                )
+-                logger.info(f"{self.charger_id} Connected to secondary server @ {secondary_url}")
+-            else:
+-                self.secondary_connection = None
+-                logger.info(f"{self.charger_id} Secondary server not enabled")
+-            
+-            # Create tasks to handle the charger. Each task each to handle receiving messages from
+-            # the charger, and the (one or two) CSMSes, and finally a watch dog task to take down
+-            # connections if connection goes stale.
+-            self._last_charger_update = time.time()
+-            self.tasks = []
+-            self.tasks.append(asyncio.create_task(self.receive_charger_messages()))
+-            self.tasks.append(asyncio.create_task(self.receive_primary_messages()))
+-            if self.secondary_connection is not None:
+-                self.tasks.append(asyncio.create_task(self.receive_secondary_messages()))
+-            #self.tasks.append(asyncio.create_task(self.watchdog()))
++            if self.secondary_url:
++                try:
++                    await self.connect_secondary()
++                except Exception as exc:
++                    logger.warning(
++                        "%s secondary CSMS unavailable (%s). Primary stays up; "
++                        "retrying every %ss. On Home Assistant OS, "
++                        "ws://172.30.32.1:<port>/ often reaches Core from an add-on "
++                        "when the LAN address does not.",
++                        self.charger_id,
++                        exc,
++                        self._retry,
++                    )
+ 
+-            # Wait for tasks to complete
+-            done, pending = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
+-            logger.debug(f"{self.charger_id} Task(s) completed: {done}, {pending}")
++            self._last_charger_update = time.time()
++            self.tasks = [
++                asyncio.create_task(self.receive_charger_messages(), name="charger"),
++                asyncio.create_task(self.receive_primary_messages(), name="primary"),
++            ]
++            if self.secondary_url:
++                self.tasks.append(
++                    asyncio.create_task(self.receive_secondary_messages(), name="secondary")
++                )
+ 
++            # Secondary loss must not end the session. Only the charger and the
++            # primary CSMS are fatal.
++            done, _pending = await asyncio.wait(
++                self.tasks[:2], return_when=asyncio.FIRST_COMPLETED
++            )
+             for task in done:
+-                e = task.exception()
+-                if e:
+-                    logger.warning(f"{self.charger_id} (Not serious - likely connection loss) Task {task} raised exception {e} related to charger ")
++                if task.cancelled():
++                    continue
++                exc = task.exception()
++                if exc:
++                    logger.warning("%s session ended: %s", self.charger_id, exc)
+ 
+-            # Cancel any remaining tasks
+-            for task in pending:
++            for task in self.tasks:
+                 task.cancel()
+-
+-        except websockets.exceptions.InvalidURI:
+-            logger.error(f"{self.charger_id} Invalid URI")
+-        except websockets.exceptions.ConnectionClosedError as e:
+-            logger.error(f"{self.charger_id} Connection closed unexpectedly: {e}")
+-        except websockets.exceptions.InvalidHandshake:
+-            logger.error(f"{self.charger_id} Handshake with the external server failed")
+-        except Exception as e:
+-            logger.error(f"{self.charger_id} Unexpected error: {e}")
++            await asyncio.gather(*self.tasks, return_exceptions=True)
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            logger.error("%s session failed: %s", self.charger_id, exc)
+         finally:
+-            # Always close stuff. close is well tempered, so can close even if not stablished
+             await self.close()
++            if OCPP2WProxy.proxy_list.get(self.charger_id) is self:
++                del OCPP2WProxy.proxy_list[self.charger_id]
+ 
+     async def receive_charger_messages(self):
+         try:
+-            while True:
+-                # Wait for a message from the charger
+-                message = await self.ws.recv()
+-                # Process the received message
+-                logger.info(f"{self.charger_id} ^ : {message}")
+-
+-                # Now, if this is an OCPP CallResult (3) or CallError (4), we need to send it back to the 
+-                # CSMS (primary or secondary) that issued the command
+-                [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
++            while not self._stopping:
++                try:
++                    message = await self.ws.recv()
++                except ConnectionClosed:
++                    logger.info("%s charger connection closed", self.charger_id)
++                    return
++                self._last_charger_update = time.time()
++                logger.info("%s ^ : %s", self.charger_id, message)
++                try:
++                    message_type, message_id = decode_ocpp_message(message)
++                except Exception as exc:
++                    logger.error("%s ignored malformed charger message: %s", self.charger_id, exc)
++                    continue
+ 
+-                # If it is a Call (2), we will send it to both primary and secondary (if connected)
+                 if message_type == OCPPMessageType.Call:
+                     await self.primary_connection.send(message)
+-                    if self.secondary_connection:
+-                        await self.secondary_connection.send(message)
+-                elif message_type == OCPPMessageType.CallResult or message_type == OCPPMessageType.CallError:
++                    await self.send_secondary(message)
++                elif message_type in (OCPPMessageType.CallResult, OCPPMessageType.CallError):
+                     if message_id in self.primary_call_ids:
+-                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to primary")
+-                        self.primary_call_ids.remove(message_id)
++                        self.primary_call_ids.discard(message_id)
++                        # The same id must not also be delivered to the secondary.
++                        self.secondary_call_ids.discard(message_id)
++                        logger.info("%s ^ reply forwarded to primary", self.charger_id)
+                         await self.primary_connection.send(message)
+                     elif message_id in self.secondary_call_ids:
+-                        logger.info(f"{self.charger_id} ^ : Result/Error forwarded to secondary")
+-                        self.secondary_call_ids.remove(message_id)
+-                        await self.secondary_connection.send(message)
++                        self.secondary_call_ids.discard(message_id)
++                        logger.info("%s ^ reply forwarded to secondary", self.charger_id)
++                        await self.send_secondary(message)
+                     else:
+-                        logger.error(f"{self.charger_id} ^: Received CallResult/CallError against unknown message id {message_id}")
++                        logger.error(
++                            "%s reply for unknown message id %s",
++                            self.charger_id,
++                            message_id,
++                        )
+                 else:
+-                    logger.error(f"{self.charger_id} ^: Unknown message type {message_type}")
+-        except Exception as e:
+-            logger.error(f"{self.charger_id} Error in receive_charger_messages: {e}")
++                    logger.error("%s unknown message type %s", self.charger_id, message_type)
++        except ConnectionClosed:
++            logger.warning("%s primary closed while forwarding from the charger", self.charger_id)
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            logger.error("%s charger loop failed: %s", self.charger_id, exc)
+ 
+     async def receive_primary_messages(self):
+         try:
+-            while True:
+-                # Wait for a message from the primary server
+-                message = await self.primary_connection.recv()
+-                logger.info(f"{self.charger_id} v (prim) : {message}")
+-
+-                [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
++            while not self._stopping:
++                try:
++                    message = await self.primary_connection.recv()
++                except ConnectionClosed:
++                    logger.warning("%s primary connection closed", self.charger_id)
++                    return
++                logger.info("%s v (prim) : %s", self.charger_id, message)
++                try:
++                    message_type, message_id = decode_ocpp_message(message)
++                except Exception as exc:
++                    logger.error("%s ignored malformed primary message: %s", self.charger_id, exc)
++                    continue
+                 if message_type == OCPPMessageType.Call:
+-                    # Record the message_id 
+                     self.primary_call_ids.add(message_id)
++                try:
++                    await self.ws.send(message)
++                except ConnectionClosed:
++                    logger.info("%s charger closed while forwarding primary", self.charger_id)
++                    return
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            logger.error("%s primary loop failed: %s", self.charger_id, exc)
+ 
+-                # Send message to the charger
+-                await self.ws.send(message)
+-        except Exception as e:
+-            logger.error(f"{self.charger_id} Error in receive_primary_messages: {e}")
++    async def handle_secondary_message(self, message: str) -> None:
++        logger.info("%s v (sec) : %s", self.charger_id, message)
++        try:
++            message_type, message_id = decode_ocpp_message(message)
++        except Exception as exc:
++            logger.error("%s ignored malformed secondary message: %s", self.charger_id, exc)
++            return
++        # Calls from the secondary are commands for the charger. Replies from
++        # the secondary are dropped so the charger only sees the primary's
++        # response to its own calls (BootNotification, MeterValues, ...).
++        if message_type != OCPPMessageType.Call:
++            logger.debug("%s secondary reply not forwarded", self.charger_id)
++            return
++        self.secondary_call_ids.add(message_id)
++        try:
++            await self.ws.send(message)
++        except ConnectionClosed:
++            logger.info("%s charger closed while forwarding secondary", self.charger_id)
++            self._stopping = True
+ 
+     async def receive_secondary_messages(self):
+-        try:
+-            while True:
+-                # Wait for a message from the secondary server
+-                message = await self.secondary_connection.recv()
+-                logger.info(f"{self.charger_id} v (sec) : {message}")
++        while not self._stopping:
++            async with self._secondary_lock:
++                connection = self.secondary_connection
++            if connection is None:
++                try:
++                    await self.connect_secondary()
++                except asyncio.CancelledError:
++                    raise
++                except Exception as exc:
++                    logger.warning("%s secondary connect failed: %s", self.charger_id, exc)
++                    await asyncio.sleep(self._retry)
++                continue
++            try:
++                message = await connection.recv()
++            except ConnectionClosed:
++                logger.warning("%s secondary connection closed", self.charger_id)
++                await self.drop_secondary(connection)
++                await asyncio.sleep(self._retry)
++                continue
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                logger.warning("%s secondary recv failed: %s", self.charger_id, exc)
++                await self.drop_secondary(connection)
++                await asyncio.sleep(self._retry)
++                continue
++            await self.handle_secondary_message(message)
+ 
+-                [message_type, message_id] = OCPP2WProxy.decode_ocpp_message(message)
+-                if message_type == OCPPMessageType.Call:
+-                    # Record the message_id 
+-                    self.secondary_call_ids.add(message_id)
+-                    # Send it to the charger
+-                    await self.ws.send(message) 
+-                # Note! We do not forward CallResults or CallErrors from the secondary server
+-                # These are silently ignored.
+-        except Exception as e:
+-            logger.error(f"{self.charger_id} Error in receive_secondary_messages: {e}")
+-
+-    async def watchdog(self):
+-        """Watch time vs. timestamp updated by receiving messages from charger."""
+-        while True:
+-            # And ... sleep
+-            await asyncio.sleep(config.getint("host", "watchdog_interval", 30))
+-
+-            elapsed = time.time() - self._last_charger_update
+-            if elapsed > config.getint("host", "watchdog_stale", 300):
+-                logger.error(f"{self.charger_id} Watch dog no for {elapsed} seconds. Closing connections")
+-                return
+ 
+-# Connection handler (charger connects)
+ async def on_connect(websocket: websockets.asyncio.server.ServerConnection):
+-    logger.debug('Connection request', websocket.request)
+-    # Determine charger_id (final part of path)
+-    path = websocket.request.path
+-    charger_id = path.strip("/")
+-    logger.info(f'{charger_id} connection request')
++    path = websocket.request.path if websocket.request is not None else ""
++    try:
++        charger_id = extract_charger_id(path)
++    except ValueError as exc:
++        logger.error("Rejected connection path %r: %s", path, exc)
++        await websocket.close(code=1008, reason="invalid charge point id")
++        return
+ 
++    logger.info("%s connection request from %s", charger_id, path)
+     try:
+-        # Delete any existing charger setup
+-        if charger_id in OCPP2WProxy.proxy_list:
+-            await OCPP2WProxy.proxy_list[charger_id].close()
+-            del OCPP2WProxy.proxy_list[charger_id]
++        for existing_id, existing in list(OCPP2WProxy.proxy_list.items()):
++            logger.info("Closing existing session %s", existing_id)
++            await existing.close()
++            if OCPP2WProxy.proxy_list.get(existing_id) is existing:
++                del OCPP2WProxy.proxy_list[existing_id]
+ 
+-        # Setup
+         proxy = OCPP2WProxy(websocket=websocket, charger_id=charger_id)
+-
+-        # Connect and run proxy operations
+         await proxy.run()
+-
+-    except Exception as e:
+-        logger.error(f'{charger_id} Error creating OCPP2WProxy: {e}')
++    except asyncio.CancelledError:
++        raise
++    except Exception as exc:
++        logger.error("%s failed: %s", charger_id, exc)
+     finally:
+-        logger.info("f{charger_id} closed/done")
++        logger.info("%s session finished", charger_id)
++
++
++def apply_log_levels() -> None:
++    if not config.has_section("logging"):
++        logger.setLevel(logging.INFO)
++        return
++    configured = []
++    for logger_name, level_name in config["logging"].items():
++        level = level_name.upper()
++        logging.getLogger(logger_name).setLevel(level)
++        configured.append((logger_name, level))
++    for logger_name, level in configured:
++        logger.info("Log level %s=%s", logger_name, level)
+ 
+ 
+-# Main. Decode arguments, setup handler
+ async def main():
+-    parser = argparse.ArgumentParser(
+-        description='ocpp-2w-proxy: A two way OCPP proxy')
+-    parser.add_argument('--version', action='version',
+-                        version=f'%(prog)s {__version__}')
++    import argparse
++
++    parser = argparse.ArgumentParser(description="ocpp-2w-proxy: a two way OCPP proxy")
++    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+     parser.add_argument(
+         "--config",
+-        type=str,
+         default="ocpp-2w-proxy.ini",
+-        help="Configuration file (INI format). Default ocpp-2w-proxy.ini",
++        help="Configuration file (INI). Default ocpp-2w-proxy.ini",
+     )
+     args = parser.parse_args()
+ 
+-    # Read config. config object is then available (via config import) to all.
+-    logger.warning(f"Reading config from {args.config}")
+-    config.read(args.config)
+-
+-    # Adjust log levels
+-    for logger_name in config["logging"]:
+-        logger.warning(f'Setting log level for {logger_name} to {config.get("logging", logger_name)}')
+-        logging.getLogger(logger_name).setLevel(level=config.get("logging", logger_name))
+-
+-    # Get host config
+-    host = config.get("host", "addr")
+-    port = config.get("host", "port")
+-    cert_chain = config.get("host", "cert_chain", fallback=None)
+-    cert_key = config.get("host", "cert_key", fallback=None)
+-    logger.debug(f"host: {host}, port: {port}, cert_chain: {cert_chain}, cert_key: {cert_key}")
+-
+-    # Start server, either ws:// or wss://
+-    if cert_chain and cert_key:
+-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+-        ssl_context.load_cert_chain(certfile=cert_chain, keyfile=cert_key)
+-        server = await websockets.serve(
+-            on_connect,
+-            host,
+-            port,
+-            subprotocols=["ocpp1.6", "ocpp2.0.1"],
+-            ssl=ssl_context,
+-            ping_timeout=config.getint("host", "ping_timeout"),
+-        )
++    config.clear()
++    if not config.read(args.config):
++        logger.error("Cannot read config %s", args.config)
++        raise SystemExit(1)
++    apply_log_levels()
++
++    host = config.get("host", "addr", fallback="0.0.0.0")
++    port = config.getint("host", "port")
++    # Charger-facing keepalive defaults to off. The Elinta charger never PONGs.
++    ping_interval = optional_ping("host", "ping_interval", None)
++    ping_timeout = optional_ping("host", "ping_timeout", None)
++    if ping_interval is None:
++        ping_timeout = None
++
++    logger.info(
++        "ocpp-2w-proxy %s (upstream %s, websockets %s)",
++        __version__,
++        UPSTREAM_COMMIT,
++        websockets.__version__,
++    )
++    if ping_interval is None:
++        logger.info("Charger-facing WebSocket pings disabled")
+     else:
+-        server = await websockets.serve(
+-            on_connect,
+-            host,
+-            port,
+-            subprotocols=["ocpp1.6", "ocpp2.0.1"],
+-            ping_timeout=config.getint("host", "ping_timeout"),
+-        )
++        logger.info("Charger-facing WebSocket ping interval %ss", ping_interval)
++
++    global active_server
++    server = await websockets.serve(
++        on_connect,
++        host,
++        port,
++        subprotocols=["ocpp1.6"],
++        ping_interval=ping_interval,
++        ping_timeout=ping_timeout,
++        compression=None,
++    )
++    active_server = server
++    bound = ", ".join(str(sock.getsockname()) for sock in (server.sockets or []))
++    logger.info("Proxy ready on %s. Waiting for the charger...", bound)
++
++    loop = asyncio.get_running_loop()
+ 
+-    logger.info("Proxy ready. Waiting for new connections...")
+-    await server.wait_closed()
++    def request_stop() -> None:
++        server.close()
++
++    for sig in (signal.SIGTERM, signal.SIGINT):
++        try:
++            loop.add_signal_handler(sig, request_stop)
++        except NotImplementedError:
++            pass
++
++    try:
++        await server.wait_closed()
++    finally:
++        server.close()
++        await server.wait_closed()
+ 
+ 
+ if __name__ == "__main__":
+     try:
+         asyncio.run(main())
+     except KeyboardInterrupt:
+-        exit(0)
++        raise SystemExit(0)
